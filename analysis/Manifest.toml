@@ -486,9 +486,9 @@ version = "1.15.1"
 
 [[deps.DifferentiationInterface]]
 deps = ["ADTypes", "LinearAlgebra"]
-git-tree-sha1 = "44d9321761ed99e1d444b5081b3166d3259adcf0"
+git-tree-sha1 = "5e6897d988addbfe7d9ad2ee467cc0c91001aae4"
 uuid = "a0c0ee7d-e4b9-4e03-894e-1c5f64a51d63"
-version = "0.7.14"
+version = "0.7.15"
 
     [deps.DifferentiationInterface.extensions]
     DifferentiationInterfaceChainRulesCoreExt = "ChainRulesCore"
@@ -921,9 +921,9 @@ version = "0.3.28"
 
 [[deps.IJulia]]
 deps = ["Base64", "Conda", "Dates", "InteractiveUtils", "Logging", "Markdown", "Pkg", "PrecompileTools", "Printf", "REPL", "Random", "SHA", "Sockets", "UUIDs", "ZMQ"]
-git-tree-sha1 = "09ea65a5f6aa2b89afbac963b34dcd483e8a3cc6"
+git-tree-sha1 = "dff8af3ab4f632d959ef19726b85939328ba289c"
 uuid = "7073ff75-c697-5162-941a-fcdaad2a7d2a"
-version = "1.34.0"
+version = "1.34.1"
 
     [deps.IJulia.extensions]
     IJuliaPythonCallExt = "PythonCall"
@@ -1713,8 +1713,8 @@ version = "2.11.2"
 
 [[deps.QuantumGrav]]
 deps = ["CausalSets", "Dates", "Distributed", "Distributions", "Graphs", "JSONSchema", "LinearAlgebra", "Pkg", "ProgressMeter", "Random", "SparseArrays", "YAML", "Zarr"]
-git-tree-sha1 = "abf210d4f8f77408a640a7490e3923a6451a7fda"
-repo-rev = "cset_creation_by_genus"
+git-tree-sha1 = "1bb88b03707a780c90a451a41b2ff63f58e96b2b"
+repo-rev = "grids_with_fixed_boundary"
 repo-subdir = "QuantumGrav.jl"
 repo-url = "https://github.com/ssciwr/QuantumGrav.git"
 uuid = "f7c7699e-e939-438e-b944-97232f27dad4"
