@@ -1970,3 +1970,143 @@ function plot_beta_bins(
 
     return fig
 end
+
+function create_grid_and_plot(
+    size::Int,
+    lattice::String,
+    rotation_angle::Float64;
+    box::Tuple{Tuple{Float64,Float64},Tuple{Float64,Float64}}=((-1.,-1.),(1.,1.)),
+    segment_ratio::Float64=2.,
+    segment_angle::Float64=60.,
+    shell_thickness::Union{Nothing,Float64} = nothing,
+    markersize::Real = 4,
+    magnification::Float64 = 1.,
+    fig_path::Union{Nothing,String}=nothing,
+    )
+    mink = CS.MinkowskiManifold{2}()
+    quad_grid_unsorted = QG.generate_grid_2d_in_box(
+        size,
+        lattice,
+        box; 
+        rotate_deg = rotation_angle, 
+        b = segment_ratio, 
+        gamma_deg = segment_angle,
+        shell_thickness = shell_thickness)
+
+    quad_grid = QG.sort_grid_by_time_from_manifold(mink, quad_grid_unsorted)
+
+    figsize = apply_paper_theme!(; magnification = magnification)
+    fig = Figure(size = figsize)
+    ax = Axis(fig[1,1])
+    ax.xlabel="x"
+    ax.ylabel="t"
+    scatter!(ax,quad_grid; markersize = magnification * markersize)
+
+    if !isnothing(fig_path)
+        save(fig_path, fig)
+    end
+    return fig, ax
+end
+
+function fourier_transform_grid_deviation(
+    comp_hist::Vector{Float64}, 
+    size::Int64, 
+    lattice::String; 
+    P_max::Float64=300., 
+    rng::Random.AbstractRNG=Random.GLOBAL_RNG, 
+    segment_ratio::Float64=1., 
+    segment_angle::Float64=60., 
+    rotation_angle::Union{Float64,Nothing}=nothing,
+    fig_path::Union{Nothing,String}=nothing,
+    magnification::Real=1.,
+    linewidth::Real=1,
+    ylim::Union{Tuple{Float64,Float64},Nothing} = nothing,
+    xtick_fracs::Union{Nothing,Vector{<:Any}}=nothing,
+    max_peak_order::Int = 5 
+    )
+    
+    grid_cset, _, _, _ = QG.create_grid_causet_in_boundary_2D_polynomial_manifold(size, lattice, CS.BoxBoundary{2}(((-1.,-1.),(1.,1.))), rng, 1, 2.; a = 1., b = segment_ratio, gamma_deg=segment_angle, rotate_deg=rotation_angle)
+    grid_cset_abundances = CS.cardinality_abundances(grid_cset)
+    idx = findfirst(iszero, comp_hist)-1
+    @show idx
+    r_comp_grid_man = grid_cset_abundances[2:idx] ./ comp_hist[2:idx] .- 1
+    r_dev_fou_comp_grid_man = abs.(fft(r_comp_grid_man))
+    r_dev_freqs_comp_grid_man = (0:length(r_dev_fou_comp_grid_man)-1) ./ length(r_dev_fou_comp_grid_man)  # cycles per sample    
+
+    f_min = 1 / P_max
+
+    freqs = r_dev_freqs_comp_grid_man
+    half = 1:fld(length(freqs), 2) 
+    keep = [i for i in half if freqs[i] >= f_min]
+    peak_idx = keep[argmax(r_dev_fou_comp_grid_man[keep])]
+    f_peak = r_dev_freqs_comp_grid_man[peak_idx]
+    P_est = 1 / f_peak           # period in “bins”
+
+    @show f_peak P_est
+
+    min_freq_for_peaks = 1 / 13
+    keep_for_peaks = [i for i in keep if r_dev_freqs_comp_grid_man[i] >= min_freq_for_peaks]
+    if !isempty(keep_for_peaks)
+        idxs = sortperm(r_dev_fou_comp_grid_man[keep_for_peaks]; rev=true)
+        printed_periods = Float64[]
+        for i in idxs
+            f = r_dev_freqs_comp_grid_man[keep_for_peaks[i]]
+            P = 1 / f
+            # Skip peaks that are effectively the same period as an earlier (stronger) peak.
+            if any(abs(P - P0) <= 0.02 for P0 in printed_periods)
+                continue
+            end
+            A = 2 * abs(r_dev_fou_comp_grid_man[keep_for_peaks[i]]) / length(r_comp_grid_man)
+            println("f = ", f, "  P ≈ ", P, "  A = ", A)
+            push!(printed_periods, P)
+            if length(printed_periods) >= max_peak_order
+                break
+            end
+        end
+    end
+
+    figsize = apply_paper_theme!(; magnification = magnification)
+    fig = Figure(size = figsize)
+    ax = Axis(fig[1,1])
+
+    if xtick_fracs !== nothing
+        xticks = collect(xtick_fracs)
+        if !isempty(xticks)
+            labels = map(xtick_fracs) do x
+                if x isa Rational
+                    n = numerator(x)
+                    d = denominator(x)
+                    if d == 1
+                        string(n)
+                    elseif n < 0
+                        LaTeXStrings.LaTeXString("-\\frac{$(abs(n))}{$d}")
+                    else
+                        LaTeXStrings.LaTeXString("\\frac{$n}{$d}")
+                    end
+                else
+                    Printf.@sprintf("%.2f", Float64(x))
+                end
+            end
+            ax.xticks = (xticks, labels)
+            vlines!(ax, xticks; color=(:black,1.), linestyle=:dash, linewidth = magnification * linewidth)
+        end
+    end
+
+    lines!(ax, r_dev_freqs_comp_grid_man[keep], r_dev_fou_comp_grid_man[keep]; linewidth = magnification * linewidth)
+    ax.xlabel = "frequency (cycles per bin)"
+    ax.ylabel = L"\mathcal{F}(\mathcal{S}_n^{\mathrm{grid}} / \mathcal{S}_n^{\mathrm{man}} -1)"
+
+    xlims!(ax, (0.,0.51))
+    if !isnothing(ylim)
+        ylims!(ax, ylim)
+    end
+
+    ax.xminorticksvisible = false
+    ax.xminorgridvisible = false
+
+    if !isnothing(fig_path)
+       save(fig_path, fig)
+    end
+
+    fig
+end
