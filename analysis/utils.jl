@@ -78,10 +78,134 @@ end
 
 
 """
+    get_size(path::AbstractString)::Int
+
+Extract the causal set size from a `dataset.jld2` file.
+"""
+function get_size(path::AbstractString)::Int
+    return JLD2.jldopen(path, "r") do f
+        config = f["meta/config"]
+        return config["cset_size"]
+    end
+end
+
+"""
+    normalize_hist(
+        hists::Vector{Vector{Dict}};
+        normalization::Union{Symbol,Float64} = :probability,
+    )::Vector{Vector{Dict{Int,Float64}}}
+
+Normalize each histogram in the output of `load_histograms_from_paths`.
+
+Normalization options:
+- `:max`          → divide each histogram by its maximum bin count
+- `:probability`  → divide each histogram by the sum of its bin counts
+- `number`        → divide each histogram by that number
+"""
+function normalize_hists(
+    hists::Vector{Vector{Dict}};
+    normalization::Union{Symbol,Real} = :probability,
+)::Vector{Vector{Dict{Int,Float64}}}
+    out = Vector{Vector{Dict{Int,Float64}}}(undef, length(hists))
+
+    for i in eachindex(hists)
+        out[i] = Vector{Dict{Int,Float64}}(undef, length(hists[i]))
+        for (j, hist) in enumerate(hists[i])
+            if normalization === :max
+                denom = isempty(hist) ? 0.0 : maximum(values(hist))
+            elseif normalization === :probability
+                denom = isempty(hist) ? 0.0 : sum(values(hist))
+            else
+                denom = normalization
+            end
+
+            @assert denom != 0.0
+            out_hist = Dict{Int,Float64}()
+            for (k, v) in hist
+                out_hist[k] = v / denom
+            end
+            out[i][j] = out_hist
+        end
+    end
+
+    return out
+end
+
+"""
+    load_fields_from_paths(
+        paths::Vector{<:AbstractString},
+        fields::AbstractVector{<:Union{Symbol,Tuple{Symbol,Int64}}};
+        filters::Union{Nothing,Vector{Union{Nothing,Function}}}=nothing,
+        thinning::Float64 = 1.0,
+    )::Vector{Vector{Vector{Float64}}}
+
+Load multiple scalar fields from `statistics.jld2` files.
+
+Returns `out[i][j]` as a `Vector{Float64}` for `fields[j]` from `paths[i]`.
+If `fields[j]` is `(sym, bin)`, the value is taken from histogram `sym` at `bin`.
+
+Only the requested fields are loaded (RAM-safe). Optional per-file filters can be applied.
+`thinning` keeps roughly a fraction of entries (e.g. 0.1 keeps ~every 10th sample).
+`filters[i] === nothing` means no filtering for that file.
+"""
+function load_fields_from_paths(
+    paths::Vector{<:AbstractString},
+    fields::Vector{Any};
+    filters::Union{Nothing,Vector{Union{Nothing,Function}}}=nothing,
+    thinning::Float64 = 1.0,
+)::Vector{Vector{Vector{Float64}}}
+    n = length(paths)
+    filters === nothing && (filters = fill(nothing, n))
+    @assert length(filters) == n
+    @assert 0.0 < thinning <= 1.0
+    step = max(1, round(Int, 1.0 / thinning))
+
+    nfields = length(fields)
+    out = [Vector{Vector{Float64}}(undef, nfields) for _ in 1:n]
+
+    Threads.@threads for i in 1:n
+        path   = paths[i]
+        filter = filters[i]
+        vals = [Float64[] for _ in 1:nfields]
+        seen = 0
+
+        JLD2.jldopen(path, "r") do f
+            nbatches = f["meta/nbatches"]
+            for b in 1:nbatches
+                batch = f["batches/$b"]
+                for x in batch
+                    filter !== nothing && !filter(x) && continue
+                    seen += 1
+                    (seen - 1) % step != 0 && continue
+                    for (j, field) in enumerate(fields)
+                        if field isa Symbol
+                            push!(vals[j], Float64(getfield(x, field)))
+                        else
+                            sym, bin = field
+                            hist = getfield(x, sym)
+                            push!(vals[j], Float64(get(hist, bin, 0)))
+                        end
+                    end
+                end
+            end
+        end
+
+        for j in 1:nfields
+            out[i][j] = vals[j]
+        end
+        println("  Loaded $(length(vals[1])) values per field from $path")
+    end
+
+    return out
+end
+
+"""
     load_histograms_from_paths(
         paths::Vector{<:AbstractString},
         histname::Symbol;
         filters::Union{Nothing,Vector{Union{Nothing,Function}}}=nothing,
+        thinning::Float64 = 1.0,
+        mmaparrays::Bool = false,
     )::Vector{Vector{Dict}}
 
 Load a single histogram field `histname` from multiple `statistics.jld2` files.
@@ -91,40 +215,44 @@ Returns a vector `out` such that:
 - only the requested histogram field is loaded (RAM-safe)
 - optional per-file filters can be applied
 
+`thinning` keeps roughly a fraction of entries (e.g. 0.1 keeps ~every 10th sample).
 `filters[i] === nothing` means no filtering for that file.
 """
 function load_histograms_from_paths(
     paths::Vector{<:AbstractString},
     histname::Symbol;
     filters::Union{Nothing,Vector{Union{Nothing,Function}}}=nothing,
+    thinning::Float64 = 1.0,
+    mmaparrays::Bool = false,
 )::Vector{Vector{Dict}}
     n = length(paths)
     filters === nothing && (filters = fill(nothing, n))
     @assert length(filters) == n
+    @assert 0.0 < thinning <= 1.0
+    step = max(1, round(Int, 1.0 / thinning))
 
     out = Vector{Vector{Dict}}(undef, n)
 
     Threads.@threads for i in 1:n
         path   = paths[i]
         filter = filters[i]
-
         hists = Dict[]
+        seen = 0
 
-        JLD2.jldopen(path, "r") do f
+        JLD2.jldopen(path, "r"; mmaparrays=mmaparrays) do f
             nbatches = f["meta/nbatches"]
-
             for b in 1:nbatches
                 batch = f["batches/$b"]
-
                 for x in batch
                     filter !== nothing && !filter(x) && continue
+                    seen += 1
+                    (seen - 1) % step != 0 && continue
                     push!(hists, getfield(x, histname))
                 end
             end
         end
-        
-        println("  Loaded $(length(hists)) histograms from $path")
 
+        println("  Loaded $(length(hists)) histograms from $path")
         out[i] = hists
     end
 
@@ -155,6 +283,47 @@ function densify_hists(hists::Vector{<:AbstractDict})
     end
 
     return dense
+end
+
+"""
+    join_histograms(hists::Vector{Vector{Vector{Dict}}})::Vector{Vector{Dict}}
+
+Join histograms across the first dimension by summing counts per bin.
+
+Given a nested structure `hists[i][j][k]::Dict`, returns `out[j][k]` where
+all dictionaries along `i` have been added bin-wise.
+"""
+function join_histograms(
+    hists::Vector{Vector{Vector{Dict}}},
+)::Vector{Vector{Dict}}
+    isempty(hists) && return Vector{Vector{Dict}}()
+
+    n_outer = length(hists)
+    n_groups = length(hists[1])
+    n_hists = length(hists[1][1])
+
+    for i in 1:n_outer
+        @assert length(hists[i]) == n_groups
+        for j in 1:n_groups
+            @assert length(hists[i][j]) == n_hists
+        end
+    end
+
+    out = [ [ Dict{Int,Int}() for _ in 1:n_hists ] for _ in 1:n_groups ]
+
+    for i in 1:n_outer
+        for j in 1:n_groups
+            for k in 1:n_hists
+                d = hists[i][j][k]
+                outd = out[j][k]
+                for (bin, count) in d
+                    outd[bin] = get(outd, bin, 0) + count
+                end
+            end
+        end
+    end
+
+    return out
 end
 
 """
@@ -568,6 +737,7 @@ function apply_paper_theme!(;
     legendpadding = nothing,
     legendmargin = nothing,
     n_Legend_columns::Int = 1,
+    color_transparency::Float64 = 1.0,
 )
     # physical sizes (in cm → inches)
     cm = 1 / 2.54
@@ -644,6 +814,17 @@ function apply_paper_theme!(;
         ))
     end
 
+    @assert 0.0 <= color_transparency <= 1.0
+    base_colors = [
+        colorant"#F1C21B",  # IBM Yellow
+        colorant"#D12771",  # IBM Magenta
+        colorant"#009D9A",  # IBM Teal
+        colorant"#FA4D56",  # IBM Red
+        colorant"#6F6F6F",  # IBM Gray
+        colorant"#0F62FE",  # IBM Blue
+        colorant"#24A148",  # IBM Green
+    ]
+
     set_theme!(
         Theme(
             figure_padding = s(10),
@@ -670,15 +851,7 @@ function apply_paper_theme!(;
             ),
 
             palette = (
-                color = [
-                    colorant"#F1C21B",  # IBM Yellow
-                    colorant"#D12771",  # IBM Magenta
-                    colorant"#009D9A",  # IBM Teal
-                    colorant"#FA4D56",  # IBM Red
-                    colorant"#6F6F6F",  # IBM Gray
-                    colorant"#0F62FE",  # IBM Blue
-                    colorant"#24A148",  # IBM Green
-                ],
+                color = [(c, color_transparency) for c in base_colors],
             ),
 
             Lines = (
@@ -700,7 +873,6 @@ end
         ylim::Union{Tuple{Float64,Float64},Nothing} = nothing,
         logscale_x::Bool = false,
         logscale_y::Bool = false,
-        normalize::Bool = false,
         plotlabel::Union{AbstractString,Nothing} = nothing,
         xlabel::Union{AbstractString,Nothing} = nothing,
         ylabel::Union{AbstractString,Nothing} = nothing,
@@ -721,7 +893,6 @@ Plot mean histograms with ±1σ bands.
 
 Each element of `data` must be `(mean, std)`, where both are vectors
 defined on the same binning.
-If `normalize` is true, each histogram is scaled so its maximum is 1.
 """
 function plot_mean_histograms_with_std(
     data::Vector{Tuple{Vector{Float64},Vector{Float64}}};
@@ -729,7 +900,6 @@ function plot_mean_histograms_with_std(
     ylim::Union{Tuple{Float64,Float64},Nothing} = nothing,
     logscale_x::Bool = false,
     logscale_y::Bool = false,
-    normalize::Bool = false,
     plotlabel::Union{AbstractString,Nothing} = nothing,
     xlabel::Union{AbstractString,Nothing} = nothing,
     ylabel::Union{AbstractString,Nothing} = nothing,
@@ -771,8 +941,8 @@ function plot_mean_histograms_with_std(
         yscale = logscale_y ? log10 : identity,
     )
 
-    ax.ylabel = ylabel === nothing ? (normalize ? "normalized count" : "count") : ylabel
-    xlabel !== nothing && (ax.xlabel = xlabel)
+    ax.ylabel = ylabel === nothing ? "count" : ylabel
+    ax.xlabel = xlabel === nothing ? L"n" : xlabel
     plotlabel !== nothing && (ax.title  = plotlabel)
 
     xlim !== nothing && xlims!(ax, xlim...)
@@ -791,14 +961,6 @@ function plot_mean_histograms_with_std(
 
     for (i, (mean, std)) in enumerate(data)
         @assert length(mean) == length(std)
-
-        if normalize && !isempty(mean)
-            max_mean = maximum(mean)
-            if max_mean > 0
-                mean = mean ./ max_mean
-                std = std ./ max_mean
-            end
-        end
 
         colors_obs = Makie.theme(:palette).color
         colors = colors_obs isa Observables.Observable ? Observables.to_value(colors_obs) : colors_obs
@@ -849,6 +1011,56 @@ function plot_mean_histograms_with_std(
     end
 
     return return_axis ? (fig, ax) : fig
+end
+
+function plot_and_save_hists(
+    hists::Vector{Vector{Dict{Int,Float64}}},
+    fig_name::String;
+    xlim::Union{Tuple{Float64,Float64},Nothing} = nothing,
+    ylim::Union{Tuple{Float64,Float64},Nothing} = nothing,
+    logscale_x::Bool = true,
+    logscale_y::Bool = true,
+    plotlabel::Union{AbstractString,Nothing} = nothing,
+    xlabel::Union{AbstractString,Nothing} = nothing,
+    ylabel::Union{AbstractString,Nothing} = nothing,
+    hist_labels::Union{Nothing,Vector{<:AbstractString}} = nothing,
+    double_column::Bool = false,
+    magnification::Real = 1.0,
+    legendpos = :rt,
+    legendpadding = (10, 8, 8, 8),
+    legendmargin = (5,5,5,5),
+    n_Legend_columns::Int = 1,
+    linewidth::Union{Nothing,Real} = nothing,
+    markersize::Union{Nothing,Real} = nothing,
+    plot_types::Union{Nothing,Vector{Symbol}} = nothing,
+    return_axis::Bool = false,
+    )::Union{Figure, Tuple{Figure, Axis}}
+    average_std = [average_histogram_with_std(hists[i]) for i in 1:length(hists)]
+    plot = plot_mean_histograms_with_std(
+        average_std; 
+        xlim = xlim,
+        ylim = ylim,
+        logscale_x = logscale_x,
+        logscale_y = logscale_y,
+        plotlabel = plotlabel,
+        xlabel = xlabel,
+        ylabel = ylabel,
+        hist_labels = hist_labels,
+        double_column = double_column,
+        magnification = magnification,
+        legendpos = legendpos,
+        legendpadding = legendpadding,
+        legendmargin = legendmargin,
+        n_Legend_columns = n_Legend_columns,
+        linewidth = linewidth,
+        markersize = markersize,
+        plot_types = plot_types,
+        return_axis = return_axis,
+        )
+
+    save(fig_path(fig_name), plot)
+
+    return plot
 end
 
 """
@@ -2109,4 +2321,113 @@ function fourier_transform_grid_deviation(
     end
 
     fig
+end
+
+function transform_to_scale!(col)
+    min_val = minimum(col)
+    max_val = maximum(col)
+    if abs(max_val - min_val) < 1e-3
+        if abs(max_val) < 1e-3
+            return col
+        end
+        return col ./ max_val
+    else
+        return (col .- min_val) ./ (max_val - min_val)
+    end
+end
+
+function parallel_plot_df(
+    data,
+    observables::AbstractVector{<:Union{Symbol,AbstractString}};
+    kinds = nothing,
+    thinning::Float64 = 1.0,
+)
+    npaths = length(data)
+    nfields = length(observables)
+    kinds === nothing && (kinds = ["set$(i)" for i in 1:npaths])
+    dfs = Vector{DataFrame}(undef, npaths)
+    @assert 0.0 < thinning <= 1.0
+    for i in 1:npaths
+        vals = data[i]
+        @assert length(vals) == nfields
+        nsamples = length(vals[1])
+        for j in 2:nfields
+            @assert length(vals[j]) == nsamples
+        end
+        step = max(1, round(Int, 1.0 / thinning))
+        idxs = 1:step:nsamples
+        df = DataFrame()
+        for (field, v) in zip(observables, vals)
+            df[!, String(field)] = Float64.(v[idxs])
+        end
+        df[!, "kind"] = fill(kinds[i], length(idxs))
+        df[!, "id"] = 1:length(idxs)
+        dfs[i] = df
+    end
+    return vcat(dfs...)
+end
+
+function create_parallel_plot(
+    plot_data::Vector{Vector{Vector{Float64}}},
+    observables::AbstractVector{<:Union{Symbol,AbstractString}},
+    kinds::Vector{String};
+    thinning::Float64 = 1.0,
+    color_transparency::Float64 = 1.0,
+    choose_kinds::Union{Nothing,Vector{Int64}} = nothing,
+)::AlgebraOfGraphics.FigureGrid
+
+    parallel_df = parallel_plot_df(plot_data, observables; kinds=kinds, thinning = thinning)
+
+    normalized_parallel_df = deepcopy(parallel_df)
+    for col in names(normalized_parallel_df)
+        if col != "kind" && col != "id" && eltype(normalized_parallel_df[!, col]) <: Number
+            normalized_parallel_df[!, col] = transform_to_scale!(normalized_parallel_df[!, col])
+        end
+    end
+    if "kind" in names(normalized_parallel_df)
+        normalized_parallel_df[!, "kind"] = CategoricalArrays.categorical(
+            normalized_parallel_df[!, "kind"];
+            levels = kinds,
+            ordered = true,
+        )
+    end
+
+    if choose_kinds !== nothing
+        selected = kinds[choose_kinds]
+        normalized_parallel_df = filter(row -> row.kind in selected, normalized_parallel_df)
+    end
+
+    n_sample = min(5000, Base.size(normalized_parallel_df, 1))
+    idxs = sample(1:Base.size(normalized_parallel_df, 1), n_sample; replace=false)
+
+    normalized_parallel_df_long = stack(
+        normalized_parallel_df[idxs, :],
+        Not(:id, :kind),
+        variable_name = :variable,
+        value_name = :value,
+    )
+
+    variables = String.(observables)
+
+    pp_specs(df) = AlgebraOfGraphics.data(df) * mapping(
+        :variable => sorter(variables),
+        :value,
+        color = :kind,
+        group = :id,
+    ) * (visual(Lines, linewidth=0.5) + visual(Scatter, alpha=0.3, markersize=7))
+
+    parallel_plot = pp_specs(normalized_parallel_df_long)
+
+    figsize = apply_paper_theme!(double_column = true, magnification = 1., color_transparency = color_transparency)
+
+    fig = draw(
+        parallel_plot,
+        figure = (; size = figsize),
+        axis = (xticklabelrotation = pi / 4, limits = (nothing, (0.0, 1.0))),
+    )
+    ax = fig.figure.current_axis[]
+    if ax !== nothing
+        ax.xticks = (1:length(variables), observables)
+    end
+    return fig
 end
